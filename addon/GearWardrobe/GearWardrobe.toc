@@ -1,0 +1,9 @@
+## Interface: 30300
+## Title: GearWardrobe
+## Notes: Gear sets stored in a server-side wardrobe (mod-gear-wardrobe). /gw to open.
+## Author: mod-gear-wardrobe
+## Version: 1.0
+## SavedVariablesPerCharacter: GearWardrobeDB
+
+GearWardrobe.lua
+GearWardrobeUI.lua

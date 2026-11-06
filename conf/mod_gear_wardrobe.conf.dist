@@ -1,0 +1,33 @@
+[worldserver]
+
+###################################################################################################
+#    MOD GEAR WARDROBE
+#
+#    Per-character gear sets backed by a database wardrobe. Pair it with the GearWardrobe client
+#    addon (modules/mod-gear-wardrobe/addon/GearWardrobe).
+###################################################################################################
+
+#
+#    GearWardrobe.Enable
+#        Description: Enable the gear wardrobe.
+#        Default:     1 (Enabled)
+#                     0 (Disabled)
+#
+
+GearWardrobe.Enable = 1
+
+#
+#    GearWardrobe.MaxSets
+#        Description: Maximum number of gear sets per character.
+#        Default:     50
+#
+
+GearWardrobe.MaxSets = 50
+
+#
+#    GearWardrobe.MaxItems
+#        Description: Maximum number of items a character can keep in the wardrobe.
+#        Default:     500
+#
+
+GearWardrobe.MaxItems = 500
