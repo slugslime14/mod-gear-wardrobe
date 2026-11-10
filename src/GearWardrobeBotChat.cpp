@@ -100,14 +100,15 @@ namespace GearWardrobe::BotChat
 
         void List(Player* sender, Player* bot, Profile const& profile)
         {
+            std::size_t const stored = Mgr::Instance().StoredCount(bot);
             if (profile.sets.empty())
             {
                 Tell(bot, sender, Acore::StringFormat("I have no gear sets ({} items in my wardrobe). "
-                    "Save what I'm wearing with gw save <name>.", profile.items.size()));
+                    "Save what I'm wearing with gw save <name>.", stored));
                 return;
             }
 
-            Tell(bot, sender, Acore::StringFormat("My gear sets ({} items in my wardrobe):", profile.items.size()));
+            Tell(bot, sender, Acore::StringFormat("My gear sets ({} items in my wardrobe):", stored));
             for (auto const& [id, set] : profile.sets)
                 Tell(bot, sender, Acore::StringFormat("{}. {} ({} slots){}", id, set.name, set.slots.size(),
                     IsWorn(bot, set) ? " - wearing it" : ""));

@@ -34,11 +34,15 @@ namespace GearWardrobe
         std::map<uint8, SlotEntry> slots; // equipment slot -> entry; missing slots are ignored
     };
 
-    // A wardrobe item lives only in item_instance while stored; this is what the addon needs to show it.
+    // A stored item keeps its item_instance row and loses its character_inventory row, as with mail. The wardrobe
+    // loads every stored item once at startup and owns the object from then on: it is not in any inventory or in
+    // the world, and it is the only copy. The database is written to but never read back for it while the server
+    // runs, so a deposit that is still being saved can't be lost by an immediate withdraw.
     struct StoredItem
     {
-        uint32 entry = 0;
-        std::string link; // entry:enchant:gem1:gem2:gem3:gem4:suffix:unique
+        Item* item = nullptr;
+        ObjectGuid::LowType depositor = 0; // also item_instance.owner_guid while stored
+        std::string link;                  // entry:enchant:gem1:gem2:gem3:gem4:suffix:unique
     };
 
     // A slot EquipSet left as it was: the item is gone (`missing`), or the server refused it with `result`.
@@ -49,10 +53,10 @@ namespace GearWardrobe
         uint32 result = 0; // InventoryResult
     };
 
+    // Per online character; the stored items are kept apart from it (`Mgr::_stored`).
     struct Profile
     {
         std::map<uint32, GearSet> sets;
-        std::map<ObjectGuid::LowType, StoredItem> items;
     };
 
     // Everything runs on the world thread: chat opcodes are thread-unsafe and commands run there too.
@@ -88,6 +92,8 @@ namespace GearWardrobe
 
         GearSet const* FindSet(Player* player, std::string const& name);
         Profile const* GetProfile(Player* player) const;
+        // Stored items `player` can see and take.
+        std::size_t StoredCount(Player* player) const;
 
         void SendSync(Player* player);
 
@@ -95,10 +101,20 @@ namespace GearWardrobe
         Profile* Find(Player* player);
         GearSet* FindSet(Profile& profile, uint32 setId, std::string& error);
         void SaveSet(Player* player, GearSet const& set);
-        void StoreDetached(Player* player, Profile& profile, Item* item, CharacterDatabaseTransaction trans);
-        Item* LoadStored(Player* player, ObjectGuid::LowType guid);
+
+        bool CanSee(Player* player, StoredItem const& stored) const;
+        StoredItem const* FindStored(Player* player, ObjectGuid::LowType guid) const;
+        // Moves an item the player just took off into the wardrobe (DB writes go into `trans`).
+        void StoreDetached(Player* player, Item* item, CharacterDatabaseTransaction trans);
+        // Removes a stored item from the wardrobe and makes `player` its owner. The caller either puts it in the
+        // player's inventory (and deletes the wardrobe row in its transaction) or hands it back with PutBack.
+        Item* TakeStored(Player* player, ObjectGuid::LowType guid, StoredItem& taken);
+        void PutBack(ObjectGuid::LowType guid, StoredItem&& taken);
+        // Forgets a stored item without touching item_instance.
+        void DropStored(ObjectGuid::LowType guid);
 
         std::unordered_map<ObjectGuid::LowType, Profile> _profiles;
+        std::unordered_map<ObjectGuid::LowType, StoredItem> _stored; // item guid -> item, every character's
     };
 }
 

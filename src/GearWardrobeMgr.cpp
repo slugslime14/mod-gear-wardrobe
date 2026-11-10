@@ -5,7 +5,7 @@
 #include "GearWardrobeComms.h"
 #include "GearWardrobeConfig.h"
 #include "Item.h"
-#include "ItemEnchantmentMgr.h"
+#include "Log.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "StringConvert.h"
@@ -45,17 +45,6 @@ namespace GearWardrobe
             for (uint8 i = 0; i < MAX_ENCHANTMENT_SLOT; ++i)
                 ench[i] = item->GetEnchantmentId(EnchantmentSlot(i));
             return BuildLink(item->GetEntry(), ench, item->GetItemRandomPropertyId(), item->GetItemSuffixFactor());
-        }
-
-        // item_instance.enchantments holds "id duration charges" for every enchantment slot.
-        std::string LinkOf(uint32 entry, std::string_view enchantments, int32 randomProperty)
-        {
-            Enchants ench{};
-            std::vector<std::string_view> tokens = Acore::Tokenize(enchantments, ' ', false);
-            for (uint8 i = 0; i < MAX_ENCHANTMENT_SLOT && i * MAX_ENCHANTMENT_OFFSET < tokens.size(); ++i)
-                ench[i] = Acore::StringTo<uint32>(tokens[i * MAX_ENCHANTMENT_OFFSET]).value_or(0);
-            uint32 const suffixFactor = randomProperty < 0 ? GenerateEnchSuffixFactor(entry) : 0;
-            return BuildLink(entry, ench, randomProperty, suffixFactor);
         }
 
         // Protocol separators and chat escapes never make it into a stored name.
@@ -188,9 +177,52 @@ namespace GearWardrobe
 
     void Mgr::OnStartup()
     {
-        // Rows whose item was deleted some other way would otherwise show as ghosts.
-        CharacterDatabase.Execute("DELETE w FROM gear_wardrobe_item w "
+        // Synchronous on purpose: the wardrobe is read once, right after these fixes, and never again.
+
+        // Rows whose item was deleted some other way would otherwise show as ghosts, and rows of a character that
+        // no longer exists point at an item that went with it.
+        CharacterDatabase.DirectExecute("DELETE w FROM gear_wardrobe_item w "
             "LEFT JOIN item_instance ii ON ii.guid = w.item_guid WHERE ii.guid IS NULL");
+        CharacterDatabase.DirectExecute("DELETE w FROM gear_wardrobe_item w "
+            "LEFT JOIN characters c ON c.guid = w.owner_guid WHERE c.guid IS NULL");
+
+        // An item can never be both carried and stored; if it ever is, the inventory copy wins and owns the item.
+        CharacterDatabase.DirectExecute("UPDATE item_instance ii "
+            "INNER JOIN gear_wardrobe_item w ON w.item_guid = ii.guid "
+            "INNER JOIN character_inventory ci ON ci.item = ii.guid SET ii.owner_guid = ci.guid");
+        CharacterDatabase.DirectExecute("DELETE w FROM gear_wardrobe_item w "
+            "INNER JOIN character_inventory ci ON ci.item = w.item_guid");
+
+        // The first 11 columns are the ones Item::LoadFromDB reads, in its order (as CHAR_SEL_MAILITEMS has them).
+        QueryResult result = CharacterDatabase.Query("SELECT ii.creatorGuid, ii.giftCreatorGuid, ii.count, "
+            "ii.duration, ii.charges, ii.flags, ii.enchantments, ii.randomPropertyId, ii.durability, ii.playedTime, "
+            "ii.text, w.item_guid, ii.itemEntry, w.owner_guid "
+            "FROM gear_wardrobe_item w INNER JOIN item_instance ii ON ii.guid = w.item_guid");
+        if (!result)
+            return;
+
+        do
+        {
+            Field* fields = result->Fetch();
+            ObjectGuid::LowType const guid = fields[11].Get<uint32>();
+            uint32 const entry = fields[12].Get<uint32>();
+            ObjectGuid::LowType const depositor = fields[13].Get<uint32>();
+
+            // An unknown entry stays in the table, out of sight, as before.
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(entry);
+            if (!proto)
+                continue;
+
+            Item* item = NewItemOrBag(proto);
+            if (!item->LoadFromDB(guid, ObjectGuid::Create<HighGuid::Player>(depositor), fields, entry))
+            {
+                delete item;
+                continue;
+            }
+            _stored[guid] = { item, depositor, LinkOf(item) };
+        } while (result->NextRow());
+
+        LOG_INFO("module", "mod-gear-wardrobe: {} stored items loaded.", _stored.size());
     }
 
     void Mgr::OnLogin(Player* player)
@@ -200,22 +232,15 @@ namespace GearWardrobe
         profile = Profile();
 
         // An item can never be both carried and stored; if it ever is, the inventory copy wins.
-        CharacterDatabase.DirectExecute("DELETE w FROM gear_wardrobe_item w "
-            "INNER JOIN character_inventory ci ON ci.item = w.item_guid WHERE w.owner_guid = {}", owner);
-
-        if (QueryResult result = CharacterDatabase.Query(
-            "SELECT w.item_guid, ii.itemEntry, ii.enchantments, ii.randomPropertyId FROM gear_wardrobe_item w "
-            "INNER JOIN item_instance ii ON ii.guid = w.item_guid WHERE w.owner_guid = {}", owner))
+        for (auto itr = _stored.begin(); itr != _stored.end();)
         {
-            do
+            ObjectGuid::LowType const guid = itr->first;
+            ++itr;
+            if (player->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(guid)))
             {
-                Field* fields = result->Fetch();
-                uint32 const entry = fields[1].Get<uint32>();
-                if (!sObjectMgr->GetItemTemplate(entry))
-                    continue;
-                std::string link = LinkOf(entry, fields[2].Get<std::string_view>(), fields[3].Get<int32>());
-                profile.items[fields[0].Get<uint32>()] = { entry, std::move(link) };
-            } while (result->NextRow());
+                CharacterDatabase.Execute("DELETE FROM gear_wardrobe_item WHERE item_guid = {}", guid);
+                DropStored(guid);
+            }
         }
 
         if (QueryResult result = CharacterDatabase.Query(
@@ -261,12 +286,67 @@ namespace GearWardrobe
         trans->Append("DELETE FROM gear_wardrobe_slot WHERE owner_guid = {}", guid);
         trans->Append("DELETE FROM gear_wardrobe_set WHERE owner_guid = {}", guid);
         _profiles.erase(guid);
+
+        for (auto itr = _stored.begin(); itr != _stored.end();)
+        {
+            ObjectGuid::LowType const itemGuid = itr->first;
+            bool const theirs = itr->second.depositor == guid;
+            ++itr;
+            if (theirs)
+                DropStored(itemGuid);
+        }
     }
 
     Profile* Mgr::Find(Player* player)
     {
         auto itr = _profiles.find(player->GetGUID().GetCounter());
         return itr != _profiles.end() ? &itr->second : nullptr;
+    }
+
+    bool Mgr::CanSee(Player* player, StoredItem const& stored) const
+    {
+        return stored.depositor == player->GetGUID().GetCounter();
+    }
+
+    StoredItem const* Mgr::FindStored(Player* player, ObjectGuid::LowType guid) const
+    {
+        auto itr = _stored.find(guid);
+        return itr != _stored.end() && CanSee(player, itr->second) ? &itr->second : nullptr;
+    }
+
+    std::size_t Mgr::StoredCount(Player* player) const
+    {
+        return std::count_if(_stored.begin(), _stored.end(),
+            [this, player](auto const& entry) { return CanSee(player, entry.second); });
+    }
+
+    Item* Mgr::TakeStored(Player* player, ObjectGuid::LowType guid, StoredItem& taken)
+    {
+        auto itr = _stored.find(guid);
+        if (itr == _stored.end() || !CanSee(player, itr->second))
+            return nullptr;
+
+        taken = std::move(itr->second);
+        _stored.erase(itr);
+
+        // Binding checks compare the owner with the character, so from here on the item is the taker's.
+        taken.item->SetOwnerGUID(player->GetGUID());
+        return taken.item;
+    }
+
+    void Mgr::PutBack(ObjectGuid::LowType guid, StoredItem&& taken)
+    {
+        taken.item->SetOwnerGUID(ObjectGuid::Create<HighGuid::Player>(taken.depositor));
+        _stored[guid] = std::move(taken);
+    }
+
+    void Mgr::DropStored(ObjectGuid::LowType guid)
+    {
+        auto itr = _stored.find(guid);
+        if (itr == _stored.end())
+            return;
+        delete itr->second.item;
+        _stored.erase(itr);
     }
 
     Profile const* Mgr::GetProfile(Player* player) const
@@ -465,8 +545,8 @@ namespace GearWardrobe
             ItemTemplate const* proto = nullptr;
             if (Item* carried = FindCarried(player, itemGuid))
                 proto = carried->GetTemplate();
-            else if (auto stored = profile->items.find(itemGuid); stored != profile->items.end())
-                proto = sObjectMgr->GetItemTemplate(stored->second.entry);
+            else if (StoredItem const* stored = FindStored(player, itemGuid))
+                proto = stored->item->GetTemplate();
 
             if (!proto)
             {
@@ -513,45 +593,24 @@ namespace GearWardrobe
         return AssignSlot(player, setId, slot, MODE_ITEM, item->GetGUID().GetCounter(), error);
     }
 
-    void Mgr::StoreDetached(Player* player, Profile& profile, Item* item, CharacterDatabaseTransaction trans)
+    void Mgr::StoreDetached(Player* player, Item* item, CharacterDatabaseTransaction trans)
     {
         // Same steps as sending an item by mail (MailHandler): out of character_inventory, item_instance kept.
         ObjectGuid::LowType const guid = item->GetGUID().GetCounter();
+        ObjectGuid::LowType const depositor = player->GetGUID().GetCounter();
         item->DeleteFromInventoryDB(trans);
         if (item->GetState() == ITEM_UNCHANGED)
             item->FSetState(ITEM_CHANGED);
         item->SetOwnerGUID(player->GetGUID());
         item->SaveToDB(trans);
         trans->Append("REPLACE INTO gear_wardrobe_item (item_guid, owner_guid, deposited) "
-            "VALUES ({}, {}, UNIX_TIMESTAMP())",
-            guid, player->GetGUID().GetCounter());
+            "VALUES ({}, {}, UNIX_TIMESTAMP())", guid, depositor);
 
-        profile.items[guid] = { item->GetEntry(), LinkOf(item) };
-        delete item;
-    }
-
-    Item* Mgr::LoadStored(Player* player, ObjectGuid::LowType guid)
-    {
-        // Same columns, in the same order, as CHAR_SEL_MAILITEMS so Item::LoadFromDB reads them unchanged.
-        QueryResult result = CharacterDatabase.Query("SELECT creatorGuid, giftCreatorGuid, count, duration, charges, "
-            "flags, enchantments, randomPropertyId, durability, playedTime, text, guid, itemEntry "
-            "FROM item_instance WHERE guid = {}", guid);
-        if (!result)
-            return nullptr;
-
-        Field* fields = result->Fetch();
-        uint32 const entry = fields[12].Get<uint32>();
-        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(entry);
-        if (!proto)
-            return nullptr;
-
-        Item* item = NewItemOrBag(proto);
-        if (!item->LoadFromDB(guid, player->GetGUID(), fields, entry))
-        {
-            delete item;
-            return nullptr;
-        }
-        return item;
+        // The wardrobe keeps the object (see StoredItem).
+        StoredItem& stored = _stored[guid];
+        if (stored.item && stored.item != item)
+            delete stored.item;
+        stored = { item, depositor, LinkOf(item) };
     }
 
     bool Mgr::Deposit(Player* player, int32 bag, int32 bagSlot, std::string& error)
@@ -571,7 +630,7 @@ namespace GearWardrobe
         }
         if (!IsWardrobeGear(item, error))
             return false;
-        if (profile->items.size() >= Cfg().maxItems)
+        if (StoredCount(player) >= Cfg().maxItems)
         {
             error = Acore::StringFormat("Your wardrobe is full ({} items).", Cfg().maxItems);
             return false;
@@ -594,7 +653,7 @@ namespace GearWardrobe
         item->SetNotRefundable(player);
         item->ClearSoulboundTradeable(player);
         player->MoveItemFromInventory(serverBag, serverSlot, true);
-        StoreDetached(player, *profile, item, trans);
+        StoreDetached(player, item, trans);
         player->SaveInventoryAndGoldToDB(trans);
         CharacterDatabase.CommitTransaction(trans);
         return true;
@@ -602,42 +661,32 @@ namespace GearWardrobe
 
     bool Mgr::Withdraw(Player* player, ObjectGuid::LowType guid, std::string& error)
     {
-        Profile* profile = Find(player);
-        if (!profile)
+        if (!Find(player))
             return false;
 
-        if (!profile->items.count(guid))
+        if (!FindStored(player, guid))
         {
             error = "That item isn't in your wardrobe.";
             return false;
         }
 
-        ObjectGuid::LowType const owner = player->GetGUID().GetCounter();
         if (player->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(guid)))
         {
-            // Already carried: the wardrobe row is stale, never load a second copy.
-            CharacterDatabase.Execute("DELETE FROM gear_wardrobe_item WHERE item_guid = {} AND owner_guid = {}",
-                guid, owner);
-            profile->items.erase(guid);
+            // Already carried: the wardrobe entry is stale, never hand out a second copy.
+            CharacterDatabase.Execute("DELETE FROM gear_wardrobe_item WHERE item_guid = {}", guid);
+            DropStored(guid);
             return true;
         }
 
-        Item* item = LoadStored(player, guid);
-        if (!item)
-        {
-            CharacterDatabase.Execute("DELETE FROM gear_wardrobe_item WHERE item_guid = {} AND owner_guid = {}",
-                guid, owner);
-            profile->items.erase(guid);
-            error = "That item no longer exists.";
-            return false;
-        }
+        StoredItem taken;
+        Item* item = TakeStored(player, guid, taken);
 
         ItemPosCountVec dest;
         InventoryResult res = player->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false);
         if (res != EQUIP_ERR_OK)
         {
             player->SendEquipError(res, item);
-            delete item;
+            PutBack(guid, std::move(taken));
             error = "Your bags are full.";
             return false;
         }
@@ -645,10 +694,9 @@ namespace GearWardrobe
         // Same steps as taking an item from mail (HandleMailTakeItem).
         CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
         player->MoveItemToInventory(dest, item, true);
-        trans->Append("DELETE FROM gear_wardrobe_item WHERE item_guid = {} AND owner_guid = {}", guid, owner);
+        trans->Append("DELETE FROM gear_wardrobe_item WHERE item_guid = {}", guid);
         player->SaveInventoryAndGoldToDB(trans);
         CharacterDatabase.CommitTransaction(trans);
-        profile->items.erase(guid);
         return true;
     }
 
@@ -671,8 +719,8 @@ namespace GearWardrobe
             ItemTemplate const* proto = nullptr;
             if (Item* carried = FindCarried(player, mh->second.item))
                 proto = carried->GetTemplate();
-            else if (auto stored = profile->items.find(mh->second.item); stored != profile->items.end())
-                proto = sObjectMgr->GetItemTemplate(stored->second.entry);
+            else if (StoredItem const* stored = FindStored(player, mh->second.item))
+                proto = stored->item->GetTemplate();
 
             if (proto && proto->InventoryType == INVTYPE_2HWEAPON)
                 targets[EQUIPMENT_SLOT_OFFHAND] = { MODE_EMPTY, 0 };
@@ -691,7 +739,7 @@ namespace GearWardrobe
             }
             if (worn && worn->GetGUID().GetCounter() == entry.item)
                 continue;
-            if (!FindCarried(player, entry.item) && !profile->items.count(entry.item))
+            if (!FindCarried(player, entry.item) && !FindStored(player, entry.item))
             {
                 // Sold, destroyed or banked: leave the slot alone.
                 failures.push_back({ slot, true, 0 });
@@ -717,13 +765,13 @@ namespace GearWardrobe
         }
 
         CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
-        ObjectGuid::LowType const owner = player->GetGUID().GetCounter();
         bool shownError = false;
 
         // Phase B: slot order already puts the main hand before the off hand.
         for (auto const& [slot, guid] : toEquip)
         {
             Item* item = nullptr;
+            StoredItem taken;
             bool fromWardrobe = false;
             if (auto itr = detached.find(guid); itr != detached.end())
             {
@@ -738,7 +786,7 @@ namespace GearWardrobe
                 player->MoveItemFromInventory(carried->GetBagSlot(), carried->GetSlot(), true);
                 item = carried;
             }
-            else if ((item = LoadStored(player, guid)))
+            else if ((item = TakeStored(player, guid, taken)))
                 fromWardrobe = true;
 
             if (!item)
@@ -760,23 +808,20 @@ namespace GearWardrobe
                     shownError = true;
                 }
                 if (fromWardrobe)
-                    delete item; // never left the wardrobe
+                    PutBack(guid, std::move(taken)); // never left the wardrobe
                 else
-                    StoreDetached(player, *profile, item, trans);
+                    StoreDetached(player, item, trans);
                 continue;
             }
 
             player->EquipItem(dest, item, true);
             if (fromWardrobe)
-            {
-                trans->Append("DELETE FROM gear_wardrobe_item WHERE item_guid = {} AND owner_guid = {}", guid, owner);
-                profile->items.erase(guid);
-            }
+                trans->Append("DELETE FROM gear_wardrobe_item WHERE item_guid = {}", guid);
         }
 
         // Phase C: whatever came off and wasn't put back goes to the wardrobe.
         for (auto const& [guid, item] : detached)
-            StoreDetached(player, *profile, item, trans);
+            StoreDetached(player, item, trans);
 
         player->AutoUnequipOffhandIfNeed();
         player->SaveInventoryAndGoldToDB(trans);
@@ -831,10 +876,10 @@ namespace GearWardrobe
                         loc = item->IsEquipped() ? 'E' : Player::IsBankPos(item->GetPos()) ? 'K' : 'B';
                         link = LinkOf(item);
                     }
-                    else if (auto stored = profile->items.find(entry.item); stored != profile->items.end())
+                    else if (StoredItem const* stored = FindStored(player, entry.item))
                     {
                         loc = 'W';
-                        link = stored->second.link;
+                        link = stored->link;
                     }
                 }
                 else
@@ -843,9 +888,16 @@ namespace GearWardrobe
             }
         }
 
+        // Oldest item guid first, as the addon got them before the wardrobe was kept in memory.
+        std::vector<ObjectGuid::LowType> visible;
+        for (auto const& [guid, stored] : _stored)
+            if (CanSee(player, stored))
+                visible.push_back(guid);
+        std::sort(visible.begin(), visible.end());
+
         std::vector<std::string> items;
-        for (auto const& [guid, item] : profile->items)
-            items.push_back(Acore::StringFormat("{},{}", guid, item.link));
+        for (ObjectGuid::LowType guid : visible)
+            items.push_back(Acore::StringFormat("{},{}", guid, _stored.at(guid).link));
 
         Comms::SendList(player, "SETS", sets);
         Comms::SendList(player, "SLOTS", slots);

@@ -71,8 +71,10 @@ Only the bot's master can use these. Spec is separate: whisper playerbots' own `
 
 ## Data
 
-- `gear_wardrobe_item`: stored item GUIDs. A wardrobe row is cleared if its item also shows up in
-  `character_inventory` (checked at login) or no longer exists (checked at startup).
+- `gear_wardrobe_item`: stored item GUIDs. The server loads every stored item once at startup and keeps it in memory
+  from then on; the database is only written to. A wardrobe row is cleared if its item also shows up in
+  `character_inventory` (checked at startup and login; the inventory copy wins) or no longer exists (checked at
+  startup).
 - `gear_wardrobe_set` and `gear_wardrobe_slot`: the sets.
 - Deleting a character removes its rows. Its stored items go with the rest of `item_instance`.
 

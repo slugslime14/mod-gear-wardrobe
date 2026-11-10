@@ -115,7 +115,7 @@ public:
         for (auto const& [id, set] : profile->sets)
             handler->PSendSysMessage("  [{}] {} ({} slots)", id, set.name, set.slots.size());
         handler->PSendSysMessage("{} gear sets, {} items in the wardrobe.", profile->sets.size(),
-            profile->items.size());
+            Mgr::Instance().StoredCount(player));
         return true;
     }
 
