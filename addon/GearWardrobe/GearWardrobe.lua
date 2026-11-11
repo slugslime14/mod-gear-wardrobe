@@ -1,6 +1,8 @@
 -- GearWardrobe: talks to the mod-gear-wardrobe server module over addon whispers to yourself.
 -- Server -> client messages are "CMD:payload"; fields are ',' separated and list entries ';' separated.
 -- Sets and the wardrobe live on the server, per character; GearWardrobeDB only holds UI preferences.
+-- The window shows one character at a time: you, or an online altbot you are master of (S.target). Requests about
+-- sets go to that character ("@guid|CMD:payload"); storing, taking out and selling always use your own bags and gold.
 
 GearWardrobe = {
     PREFIX = "GWRD",
@@ -8,7 +10,16 @@ GearWardrobe = {
     setById = {},
     items = {},             -- wardrobe contents: { guid, item }  (item = "item:..." string)
     itemByGuid = {},
+    out = {},               -- shared wardrobe: items another character took out: { guid, item, holder, out = true }
+    outByGuid = {},
     setsByGuid = {},        -- item guid -> { { set, invSlot }, ... } for every set slot that names that item
+    noUse = {},             -- stored item guid -> why the shown character can't wear it (server reason code)
+    usedBy = {},            -- item guid -> { { invSlot, character, set }, ... }, every character sharing the wardrobe
+    carried = {},           -- another character's gear: { guid, loc = "E"|"B", reason, item }
+    chars = {},             -- the characters you can show: { guid, name, class, level, self, offline }
+    target = nil,           -- guid of the character shown, nil for yourself
+    viewing = { self = true, samePool = true },  -- whose data the last sync held: { guid, name, self, samePool, offline }
+    mySets = {},            -- your own sets (the quick-swap bar and /gw equip), whoever is shown
     maxSets = 0,
     maxItems = 0,
     listeners = {},
@@ -66,11 +77,51 @@ local FITS = {
     [19] = { INVTYPE_TABARD = true },
 }
 
-S.LOCATIONS = { E = "Worn", B = "In your bags", K = "In your bank", W = "In the wardrobe", M = "Missing" }
+S.LOCATIONS = { E = "Worn", B = "In your bags", K = "In your bank", W = "In the wardrobe", O = "Another character has it",
+    M = "Missing" }
+
+-- Who has a taken-out item (shared wardrobe), or nil.
+function S:HolderOf(guid)
+    local out = guid and self.outByGuid[guid]
+    return out and out.holder
+end
+
+-- Why the shown character can't wear an item (codes from the server's CanWear).
+local REASONS = {
+    [2] = "Skill too low",
+    [8] = "Can't use this armor or weapon type",
+    [10] = "Wrong class or race",
+    [11] = "Wrong class or race",
+    [14] = "Can't dual wield",
+    [17] = "Unique, and already carried",
+    [20] = "Can't wear this",
+    [39] = "Not allowed right now",
+    [64] = "Reputation too low",
+    [1000] = "From an expansion not reached yet",
+}
+
+-- `reason` is a code from NOUSE / CARRIED; nil when the item can be worn.
+function S:WhyNot(reason, item)
+    if not reason then
+        return nil
+    end
+    if reason == 1 then
+        local _, _, _, _, minLevel = GetItemInfo(item or "")
+        return minLevel and ("Requires level " .. minLevel) or "Level too low"
+    end
+    return REASONS[reason] or ("Can't wear this (error " .. reason .. ")")
+end
+
+-- The name of the character shown.
+function S:ViewingName()
+    return self.viewing.name or UnitName("player")
+end
 
 local DEFAULTS = {
     showBar = false,
     barPoint = nil,
+    usableOnly = true,   -- hide gear the shown character can't wear
+    unusedOnly = false,  -- show only gear no gear set uses
 }
 
 -- ---------------------------------------------------------------------------------------------------------------
@@ -91,12 +142,30 @@ function S:Print(text)
     DEFAULT_CHAT_FRAME:AddMessage("|cffc8a2ff[Wardrobe]|r " .. text)
 end
 
+-- About yourself. The server answers with your own sync, so the window then shows you.
 function S:Send(command, payload)
     SendAddonMessage(self.PREFIX, command .. ":" .. (payload or ""), "WHISPER", UnitName("player"))
 end
 
+-- About the character shown. Storing, taking out and selling go through here too: the server still uses your bags
+-- and gold for them, and answers with the shown character's sync.
+function S:SendFor(command, payload)
+    local prefix = self.target and ("@" .. self.target .. "|") or ""
+    SendAddonMessage(self.PREFIX, prefix .. command .. ":" .. (payload or ""), "WHISPER", UnitName("player"))
+end
+
 function S:Sync()
-    self:Send("SYNC")
+    self:SendFor("SYNC")
+end
+
+-- Shows another character (a guid from S.chars), or yourself with nil.
+function S:SelectCharacter(guid)
+    local me = self.chars[1]
+    if me and guid == me.guid then
+        guid = nil
+    end
+    self.target = guid
+    self:Sync()
 end
 
 -- ---------------------------------------------------------------------------------------------------------------
@@ -147,22 +216,44 @@ function S:SetIcon(set)
     return "Interface\\Icons\\INV_Misc_QuestionMark"
 end
 
+-- One of your own sets, by name.
 function S:FindSet(name)
     name = (name or ""):lower()
-    for _, set in ipairs(self.sets) do
+    for _, set in ipairs(self.mySets) do
         if set.name:lower() == name then
             return set
         end
     end
 end
 
--- Every item that could fill `invSlot`: { item, source = "W"|"B"|"E", guid | bag+slot | invSlot }.
+-- Every item that could fill `invSlot`: { item, source = "W"|"B"|"E", guid | bag+slot | invSlot }. Identical stored
+-- copies are one candidate (`count` copies), naming a copy no gear set uses if there is one.
 function S:Candidates(invSlot)
     local list = {}
+    local byItem = {}
     for _, stored in ipairs(self.items) do
         if self:Fits(invSlot, stored.item) then
-            table.insert(list, { item = stored.item, source = "W", guid = stored.guid })
+            local candidate = byItem[stored.item]
+            if not candidate then
+                candidate = { item = stored.item, source = "W", guid = stored.guid, count = 0,
+                    reason = self.noUse[stored.guid] }
+                byItem[stored.item] = candidate
+                table.insert(list, candidate)
+            elseif self.setsByGuid[candidate.guid] and not self.setsByGuid[stored.guid] then
+                candidate.guid = stored.guid
+            end
+            candidate.count = candidate.count + 1
         end
+    end
+    -- Another character: its own gear comes from the server, since the client only sees yours.
+    if not self.viewing.self then
+        for _, carried in ipairs(self.carried) do
+            if self:Fits(invSlot, carried.item) then
+                table.insert(list, { item = carried.item, source = carried.loc, guid = carried.guid,
+                    reason = carried.reason, theirs = true })
+            end
+        end
+        return list
     end
     for _, slot in ipairs(self.SLOTS) do
         local item = ItemString(GetInventoryItemLink("player", slot.id))
@@ -185,37 +276,42 @@ end
 -- Requests
 
 function S:CreateSet(name)
-    self:Send("NEW", name)
+    self:SendFor("NEW", name)
 end
 
 function S:RenameSet(id, name)
-    self:Send("REN", id .. "," .. name)
+    self:SendFor("REN", id .. "," .. name)
 end
 
 function S:DeleteSet(id)
-    self:Send("DEL", id)
+    self:SendFor("DEL", id)
 end
 
 function S:SetSetIcon(id, texture)
-    self:Send("ICON", id .. "," .. ((texture or ""):match("([^\\]+)$") or ""))
+    self:SendFor("ICON", id .. "," .. ((texture or ""):match("([^\\]+)$") or ""))
 end
 
 function S:SaveWorn(id)
-    self:Send("SAVE", id)
+    self:SendFor("SAVE", id)
 end
 
 function S:Equip(id)
-    self:Send("EQUIP", id)
+    self:SendFor("EQUIP", id)
 end
 
 function S:SetSlotMode(id, invSlot, mode)
-    self:Send("SLOT", string.format("%d,%d,%d,0", id, invSlot - 1, mode))
+    self:SendFor("SLOT", string.format("%d,%d,%d,0", id, invSlot - 1, mode))
+end
+
+-- Your own set, from the quick-swap bar or /gw equip, whoever the window shows.
+function S:EquipOwn(id)
+    self:Send("EQUIP", id)
 end
 
 -- `candidate` comes from S:Candidates.
 function S:AssignSlot(id, invSlot, candidate)
-    if candidate.source == "W" then
-        self:Send("SLOT", string.format("%d,%d,%d,%s", id, invSlot - 1, self.MODE_ITEM, candidate.guid))
+    if candidate.source == "W" or candidate.theirs then
+        self:SendFor("SLOT", string.format("%d,%d,%d,%s", id, invSlot - 1, self.MODE_ITEM, candidate.guid))
     elseif candidate.source == "E" then
         self:Send("SLOTPOS", string.format("%d,%d,-1,%d", id, invSlot - 1, candidate.invSlot))
     else
@@ -225,15 +321,31 @@ end
 
 -- bag -1 means the character sheet, with `slot` an inventory slot id.
 function S:Deposit(bag, slot)
-    self:Send("DEP", bag .. "," .. slot)
+    self:SendFor("DEP", bag .. "," .. slot)
 end
 
+-- For another character the server also stores the item (from your bags) before assigning it.
 function S:AssignFromPos(id, invSlot, bag, slot)
-    self:Send("SLOTPOS", string.format("%d,%d,%d,%d", id, invSlot - 1, bag, slot))
+    self:SendFor("SLOTPOS", string.format("%d,%d,%d,%d", id, invSlot - 1, bag, slot))
 end
 
 function S:Withdraw(guid)
-    self:Send("WD", guid)
+    self:SendFor("WD", guid)
+end
+
+-- Removes stored items for good; you get their vendor price. Sent in batches that fit one message.
+function S:Sell(guids)
+    local batch = ""
+    for _, guid in ipairs(guids) do
+        if #batch + #guid + 1 > 230 then
+            self:SendFor("SELL", batch)
+            batch = ""
+        end
+        batch = batch == "" and guid or (batch .. "," .. guid)
+    end
+    if batch ~= "" then
+        self:SendFor("SELL", batch)
+    end
 end
 
 -- ---------------------------------------------------------------------------------------------------------------
@@ -269,8 +381,67 @@ local function Entries(payload)
     return payload:gmatch("[^;]+")
 end
 
-handlers.BEGIN = function()
-    pending = { sets = {}, setById = {}, items = {}, itemByGuid = {} }
+-- "guid,name,self,samePool,offline" (older servers send less, or nothing: then it is always you, online).
+handlers.BEGIN = function(payload)
+    local guid, name, isSelf, samePool, offline = payload:match("^(%d+),([^,]*),(%d),(%d),?(%d?)$")
+    pending = { sets = {}, setById = {}, items = {}, itemByGuid = {}, out = {}, outByGuid = {}, noUse = {},
+        usedBy = {}, carried = {}, chars = {},
+        viewing = { guid = guid, name = name, self = isSelf ~= "0", samePool = samePool ~= "0",
+            offline = offline == "1" } }
+end
+
+handlers.NOUSE = function(payload)
+    if not pending then return end
+    for entry in Entries(payload) do
+        local guid, reason = entry:match("^(%d+),(%d+)$")
+        if guid then
+            pending.noUse[guid] = tonumber(reason)
+        end
+    end
+end
+
+-- "guid,slot,character,set"
+handlers.USEDBY = function(payload)
+    if not pending then return end
+    for entry in Entries(payload) do
+        local guid, slot, character, set = entry:match("^(%d+),(%d+),([^,]*),(.*)$")
+        if guid then
+            pending.usedBy[guid] = pending.usedBy[guid] or {}
+            table.insert(pending.usedBy[guid], { invSlot = tonumber(slot) + 1, character = character, set = set })
+        end
+    end
+end
+
+-- "guid,loc,reason,item" for another character's worn (E) and carried (B) gear.
+handlers.CARRIED = function(payload)
+    if not pending then return end
+    for entry in Entries(payload) do
+        local guid, loc, reason, item = entry:match("^(%d+),(%a),(%d+),(.+)$")
+        if guid then
+            table.insert(pending.carried, { guid = guid, loc = loc, reason = reason ~= "0" and tonumber(reason) or nil,
+                item = "item:" .. item })
+        end
+    end
+end
+
+-- "guid,name,class,level,offline": you first, then your online altbots, then offline characters sharing the
+-- wardrobe (their sets can be edited, not equipped).
+handlers.CHARS = function(payload)
+    if not pending then return end
+    for entry in Entries(payload) do
+        local guid, name, class, level, offline = entry:match("^(%d+),([^,]*),(%d+),(%d+),?(%d?)$")
+        if guid then
+            table.insert(pending.chars, { guid = guid, name = name, class = tonumber(class), level = tonumber(level),
+                self = #pending.chars == 0, offline = offline == "1" })
+        end
+    end
+end
+
+-- A bot whisper or a command changed what the window may show: ask again for whoever it shows.
+handlers.CHANGED = function()
+    if S.IsShown and S:IsShown() then
+        S:QueueSync()
+    end
 end
 
 handlers.SETS = function(payload)
@@ -313,10 +484,34 @@ handlers.ITEMS = function(payload)
     end
 end
 
+-- Shared wardrobe: "guid,holder,item" for items another character took out.
+handlers.OUT = function(payload)
+    if not pending then return end
+    for entry in Entries(payload) do
+        local guid, holder, item = entry:match("^(%d+),([^,]*),(.+)$")
+        if guid then
+            local out = { guid = guid, holder = holder, item = "item:" .. item, out = true }
+            table.insert(pending.out, out)
+            pending.outByGuid[guid] = out
+        end
+    end
+end
+
 handlers.END = function(payload)
     if not pending then return end
     local maxSets, maxItems = payload:match("^(%d+),(%d+)$")
     S.sets, S.setById, S.items, S.itemByGuid = pending.sets, pending.setById, pending.items, pending.itemByGuid
+    S.out, S.outByGuid = pending.out, pending.outByGuid
+    S.noUse, S.usedBy, S.carried = pending.noUse, pending.usedBy, pending.carried
+    S.viewing = pending.viewing
+    if #pending.chars > 0 then
+        S.chars = pending.chars
+    end
+    -- The server decides who is shown: a bot that went offline falls back to you.
+    S.target = (not S.viewing.self) and S.viewing.guid or nil
+    if S.viewing.self then
+        S.mySets = S.sets
+    end
     S.maxSets, S.maxItems = tonumber(maxSets) or 0, tonumber(maxItems) or 0
     pending = nil
     S.setsByGuid = {}
@@ -336,9 +531,12 @@ handlers.EQRES = function(payload)
     for entry in Entries(payload) do
         local slot, reason = entry:match("^(%d+),(.+)$")
         local info = slot and S.SLOTS[tonumber(slot) + 1]
-        if info then
+        local holder = reason and reason:match("^held,(.*)$")
+        if info and holder then
+            S:Print(string.format("%s: %s has that item", info.label, holder))
+        elseif info then
             S:Print(string.format("%s: %s", info.label, reason == "missing" and "item not found (sold, banked or destroyed)"
-                or "couldn't be equipped (error " .. reason .. "); it is in the wardrobe"))
+                or (S:WhyNot(tonumber(reason)) or "couldn't be equipped") .. ", skipped"))
         end
     end
 end

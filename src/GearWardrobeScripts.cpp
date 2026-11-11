@@ -35,6 +35,7 @@ public:
     GearWardrobePlayerScript() : PlayerScript("GearWardrobePlayerScript", {
         PLAYERHOOK_ON_LOGIN,
         PLAYERHOOK_ON_LOGOUT,
+        PLAYERHOOK_ON_DELETE,
         PLAYERHOOK_ON_DELETE_FROM_DB,
         PLAYERHOOK_CAN_PLAYER_USE_PRIVATE_CHAT
     }) { }
@@ -48,6 +49,11 @@ public:
     void OnPlayerLogout(Player* player) override
     {
         Mgr::Instance().OnLogout(player);
+    }
+
+    void OnPlayerDelete(ObjectGuid guid, uint32 /*accountId*/) override
+    {
+        Mgr::Instance().OnDelete(guid.GetCounter());
     }
 
     void OnPlayerDeleteFromDB(CharacterDatabaseTransaction trans, uint32 guid) override
@@ -139,8 +145,9 @@ public:
             handler->SendSysMessage(error);
             return false;
         }
-        Mgr::Instance().SendEquipResult(player, set->id, failures);
-        Mgr::Instance().SendSync(player);
+        Mgr::Instance().SendEquipResult(player, player, set->id, failures);
+        // The addon may be showing an altbot; it syncs again whatever it shows.
+        Comms::Send(player, "CHANGED");
         return true;
     }
 };

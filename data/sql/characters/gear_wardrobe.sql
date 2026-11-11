@@ -26,3 +26,15 @@ CREATE TABLE IF NOT EXISTS `gear_wardrobe_slot` (
   `item_guid` INT UNSIGNED NOT NULL DEFAULT 0,
   PRIMARY KEY (`owner_guid`, `set_id`, `slot`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Shared wardrobe (GearWardrobe.SharedPool): items taken out of the wardrobe, and who has them, so the other
+-- characters still see them (as unavailable). A row goes when the item is stored again or is no longer found on
+-- that character. `link` is the item string the addon shows while the holder is offline.
+CREATE TABLE IF NOT EXISTS `gear_wardrobe_out` (
+  `item_guid` INT UNSIGNED NOT NULL,
+  `holder_guid` INT UNSIGNED NOT NULL,
+  `link` VARCHAR(160) NOT NULL DEFAULT '',
+  `taken` INT UNSIGNED NOT NULL DEFAULT 0,
+  PRIMARY KEY (`item_guid`),
+  KEY `idx_holder` (`holder_guid`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

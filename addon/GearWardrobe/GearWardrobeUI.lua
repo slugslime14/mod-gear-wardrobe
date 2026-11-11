@@ -14,10 +14,13 @@ local ALL_GEAR_ICON = "Interface\\Icons\\INV_Misc_Bag_08"
 -- The wardrobe's slot list, top to bottom; 0 is "All gear". Rings and trinkets share one row each.
 local WARDROBE_SLOTS = { 0, 1, 2, 3, 15, 5, 4, 19, 9, 10, 6, 7, 8, 11, 13, 16, 17, 18 }
 local QUESTION_MARK = "Interface\\Icons\\INV_Misc_QuestionMark"
+-- Shared wardrobe: drawn over an item another character has.
+local UNAVAILABLE_MARK = "Interface\\RaidFrame\\ReadyCheck-NotReady"
 
 local frame, setsPanel, wardrobePanel, setsTab, wardrobeTab
 local listScroll, listRows, editorTitle, iconButton, slotButtons, equipButton, saveButton, renameButton, deleteButton
-local gridButtons, gridPage, pageText, countText, searchBox, slotRows, gridTitle
+local gridButtons, gridPage, pageText, countText, searchBox, slotRows, gridTitle, gridCopies
+local characterDrop, usableCheck, unusedCheck, sellShownButton, offlineNote
 local menuFrame, bar
 local selectedId
 local filterSlot = 0
@@ -52,6 +55,11 @@ local function CreateItemButton(parent, size)
     button.border:Hide()
     button.caption = button:CreateFontString(nil, "OVERLAY", "NumberFontNormalSmall")
     button.caption:SetPoint("BOTTOMRIGHT", -2, 2)
+    button.unavailable = button:CreateTexture(nil, "OVERLAY")
+    Size(button.unavailable, size * 0.6, size * 0.6)
+    button.unavailable:SetPoint("CENTER")
+    button.unavailable:SetTexture(UNAVAILABLE_MARK)
+    button.unavailable:Hide()
     button:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
     button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     return button
@@ -65,6 +73,46 @@ local function SetQualityBorder(button, quality)
     else
         button.border:Hide()
     end
+end
+
+-- Greys an item out and marks it with a red X: another character has it (shared wardrobe).
+local function SetUnavailable(button, unavailable)
+    button.icon:SetDesaturated(unavailable)
+    if unavailable then
+        button.icon:SetVertexColor(0.6, 0.6, 0.6)
+        button.unavailable:Show()
+    else
+        button.unavailable:Hide()
+    end
+end
+
+-- Greys an item out without the red X: the shown character can't wear it.
+local function SetUnusable(button)
+    button.icon:SetDesaturated(true)
+    button.icon:SetVertexColor(0.5, 0.5, 0.5)
+end
+
+-- The class color of a CHARS entry's class id.
+local CLASS_FILES = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "DEATHKNIGHT", "SHAMAN", "MAGE", "WARLOCK",
+    nil, "DRUID" }
+
+local function CharacterLabel(char)
+    local file = CLASS_FILES[char.class]
+    local color = file and RAID_CLASS_COLORS[file]
+    local name = color and string.format("|cff%02x%02x%02x%s|r", color.r * 255, color.g * 255, color.b * 255, char.name)
+        or char.name
+    local class = file and LOCALIZED_CLASS_NAMES_MALE and LOCALIZED_CLASS_NAMES_MALE[file] or ""
+    return string.format("%s  |cff888888%d %s%s|r", name, char.level, class,
+        char.self and ", you" or (char.offline and ", offline" or ""))
+end
+
+-- Vendor price of an "item:..." string (GetItemInfo's 11th value), or nil while the client doesn't know it.
+local function SellPrice(item)
+    return (select(11, GetItemInfo(item or "")))
+end
+
+local function Money(copper)
+    return copper and GetCoinTextureString(copper) or "its vendor price"
 end
 
 local function SelectedSet()
@@ -147,6 +195,20 @@ StaticPopupDialogs["GEARWARDROBE_DELETE"] = {
     hideOnEscape = 1,
 }
 
+-- data = { guids }; the text is built by the caller.
+StaticPopupDialogs["GEARWARDROBE_SELL"] = {
+    text = "%s",
+    button1 = YES,
+    button2 = NO,
+    OnAccept = function(self)
+        S:Sell(self.data)
+    end,
+    timeout = 0,
+    whileDead = 1,
+    hideOnEscape = 1,
+    showAlert = 1,
+}
+
 -- ---------------------------------------------------------------------------------------------------------------
 -- Set list
 
@@ -176,7 +238,12 @@ local function SlotTooltip(button)
     local set = SelectedSet()
     local entry = set and set.slots[button.slot.id]
     GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
-    if entry and entry.mode == S.MODE_ITEM and entry.item then
+    if entry and entry.mode == S.MODE_ITEM and entry.item and entry.loc == "O" then
+        GameTooltip:SetHyperlink(entry.item)
+        GameTooltip:AddLine(" ")
+        GameTooltip:AddLine((S:HolderOf(entry.guid) or "Another character") .. " has this item", 1, 0.2, 0.2)
+        GameTooltip:AddLine("Equipping the set skips this slot until it is back in the wardrobe.", 1, 1, 1, true)
+    elseif entry and entry.mode == S.MODE_ITEM and entry.item then
         GameTooltip:SetHyperlink(entry.item)
         GameTooltip:AddLine(" ")
         GameTooltip:AddLine(S.LOCATIONS[entry.loc] or "", entry.loc == "M" and 1 or 0.6, entry.loc == "M" and 0.2 or 0.8, entry.loc == "M" and 0.2 or 1)
@@ -204,14 +271,20 @@ local function SlotMenu(button)
         { text = "Leave this slot empty", notCheckable = true, func = function() S:SetSlotMode(set.id, invSlot, S.MODE_EMPTY) end },
     }
     local where = { W = "wardrobe", B = "bags", E = "worn" }
-    local count = 0
+    local count, hidden = 0, 0
     for _, candidate in ipairs(S:Candidates(invSlot)) do
         local name, _, quality, texture = S:ItemInfo(candidate.item)
-        if name and count < 25 then
+        local why = S:WhyNot(candidate.reason, candidate.item)
+        if why and GearWardrobeDB.usableOnly then
+            hidden = hidden + 1
+        elseif name and count < 25 then
             count = count + 1
             local color = ITEM_QUALITY_COLORS[quality] or ITEM_QUALITY_COLORS[1]
+            -- Still assignable when greyed: a set can be planned for a level not reached yet.
             table.insert(entries, {
-                text = color.hex .. name .. "|r |cff888888(" .. where[candidate.source] .. ")|r",
+                text = (why and "|cff808080" or color.hex) .. name .. "|r |cff888888(" .. where[candidate.source]
+                    .. ((candidate.count or 1) > 1 and ", " .. candidate.count or "")
+                    .. (why and ", " .. why:lower() or "") .. ")|r",
                 icon = texture,
                 notCheckable = true,
                 func = function() S:AssignSlot(set.id, invSlot, candidate) end,
@@ -219,7 +292,12 @@ local function SlotMenu(button)
         end
     end
     if count == 0 then
-        table.insert(entries, { text = "No matching gear in your bags or wardrobe", disabled = true, notCheckable = true })
+        table.insert(entries, { text = "No matching gear " .. (S.viewing.self and "in your bags or wardrobe"
+            or "on " .. S:ViewingName() .. " or in the wardrobe"), disabled = true, notCheckable = true })
+    end
+    if hidden > 0 then
+        table.insert(entries, { text = string.format("%d more %s can't wear (Usable only is on)", hidden,
+            S:ViewingName()), disabled = true, notCheckable = true })
     end
     ShowMenu(entries)
 end
@@ -229,6 +307,15 @@ local function SlotReceiveDrag(button)
     local bag, slot = S:CursorPosition()
     if not set or not bag then return false end
     ClearCursor()
+    if not S.viewing.self then
+        -- Your item goes into the wardrobe and into their set in one request.
+        if S.viewing.samePool then
+            S:AssignFromPos(set.id, button.slot.id, bag, slot)
+        else
+            S:Print(S:ViewingName() .. " doesn't share your wardrobe.")
+        end
+        return true
+    end
     -- Assign first: the server resolves the item by position, then the deposit moves it into the wardrobe.
     S:AssignFromPos(set.id, button.slot.id, bag, slot)
     if bag ~= -1 then
@@ -247,11 +334,14 @@ local function UpdateEditor()
         button.icon:SetDesaturated(false)
         button.caption:SetText("")
         SetQualityBorder(button, nil)
+        SetUnavailable(button, false)
         if entry and entry.mode == S.MODE_ITEM then
             local _, _, quality, texture = S:ItemInfo(entry.item)
             button.icon:SetTexture(texture or QUESTION_MARK)
             SetQualityBorder(button, quality)
-            if entry.loc == "M" or entry.loc == "K" then
+            if entry.loc == "O" then
+                SetUnavailable(button, true)
+            elseif entry.loc == "M" or entry.loc == "K" then
                 button.icon:SetVertexColor(1, 0.2, 0.2)
             end
             button.caption:SetText(entry.loc == "W" and "|cffc8a2ffW|r" or "")
@@ -270,8 +360,17 @@ local function UpdateEditor()
         editorTitle:SetText(set.name)
         iconButton.icon:SetTexture(S:SetIcon(set))
         iconButton:Show()
-        equipButton:Enable()
-        saveButton:Enable()
+        -- Offline characters: their sets can be edited, but nothing can be put on or read from what they wear.
+        if S.viewing.offline then
+            equipButton:Disable()
+            saveButton:Disable()
+            offlineNote:SetText(S:ViewingName() .. " is offline: log them in to equip or save worn gear.")
+            offlineNote:Show()
+        else
+            equipButton:Enable()
+            saveButton:Enable()
+            offlineNote:Hide()
+        end
         renameButton:Enable()
         deleteButton:Enable()
     else
@@ -279,6 +378,7 @@ local function UpdateEditor()
         iconButton:Hide()
         equipButton:Disable()
         saveButton:Disable()
+        offlineNote:Hide()
         renameButton:Disable()
         deleteButton:Disable()
     end
@@ -306,25 +406,104 @@ end
 -- ---------------------------------------------------------------------------------------------------------------
 -- Wardrobe grid
 
+-- The grid shows each kind of item once: identical copies (same item, enchant, gems and suffix) share a button,
+-- { item, copies = { stored... }, available = <copies in the wardrobe> }. Groups with a stored copy come first.
 local function GridFilter()
     gridList = {}
+    gridCopies = 0
+    local byItem = {}
     local search = searchBox and searchBox:GetText():lower() or ""
-    for _, stored in ipairs(S.items) do
-        local name = S:ItemInfo(stored.item)
-        local matches = search == "" or (name and name:lower():find(search, 1, true))
-        if matches and (filterSlot == 0 or S:Fits(filterSlot, stored.item)) then
-            table.insert(gridList, stored)
+    -- Stored items first, then the ones another character took out (shared wardrobe).
+    for _, list in ipairs({ S.items, S.out }) do
+        for _, stored in ipairs(list) do
+            local name = S:ItemInfo(stored.item)
+            local matches = search == "" or (name and name:lower():find(search, 1, true))
+            -- Copies another character has carry no usable flag; they stay in view.
+            local usable = not GearWardrobeDB.usableOnly or not S.noUse[stored.guid]
+            local unused = not GearWardrobeDB.unusedOnly or not S.usedBy[stored.guid]
+            if matches and usable and unused and (filterSlot == 0 or S:Fits(filterSlot, stored.item)) then
+                local group = byItem[stored.item]
+                if not group then
+                    group = { item = stored.item, copies = {}, available = 0 }
+                    byItem[stored.item] = group
+                    table.insert(gridList, group)
+                end
+                table.insert(group.copies, stored)
+                if not stored.out then
+                    group.available = group.available + 1
+                end
+                gridCopies = gridCopies + 1
+            end
         end
     end
 end
 
+-- Every gear set slot, of any character sharing the wardrobe, that uses a copy in `group`.
+local function GroupUsedBy(group)
+    local uses = {}
+    for _, copy in ipairs(group.copies) do
+        for _, use in ipairs(S.usedBy[copy.guid] or {}) do
+            table.insert(uses, use)
+        end
+    end
+    return uses
+end
+
+-- Why the shown character can't wear `group`'s item, or nil (identical copies agree).
+local function GroupWhyNot(group)
+    for _, copy in ipairs(group.copies) do
+        if not copy.out then
+            return S:WhyNot(S.noUse[copy.guid], copy.item)
+        end
+    end
+end
+
+-- Stored copies in `group`, the unused ones first.
+local function StoredCopies(group)
+    local copies = {}
+    for _, copy in ipairs(group.copies) do
+        if not copy.out and not S.usedBy[copy.guid] then table.insert(copies, copy) end
+    end
+    for _, copy in ipairs(group.copies) do
+        if not copy.out and S.usedBy[copy.guid] then table.insert(copies, copy) end
+    end
+    return copies
+end
+
+-- Every gear set slot of the shown character that uses any copy in `group`.
+local function GroupUses(group)
+    local uses = {}
+    for _, copy in ipairs(group.copies) do
+        for _, use in ipairs(S.setsByGuid[copy.guid] or {}) do
+            table.insert(uses, use)
+        end
+    end
+    return uses
+end
+
+-- The copy a right-click takes out: a stored one no gear set uses, else any stored one.
+local function CopyToTake(group)
+    local fallback
+    for _, copy in ipairs(group.copies) do
+        if not copy.out then
+            if not S.setsByGuid[copy.guid] then
+                return copy
+            end
+            fallback = fallback or copy
+        end
+    end
+    return fallback
+end
+
 -- The slot list on the left: how many stored items fit each slot, and which slot the grid shows.
 local function UpdateSlotList()
-    local counts = { [0] = #S.items }
-    for _, stored in ipairs(S.items) do
-        for _, row in ipairs(slotRows) do
-            if row.invSlot ~= 0 and S:Fits(row.invSlot, stored.item) then
-                counts[row.invSlot] = (counts[row.invSlot] or 0) + 1
+    local counts = { [0] = #S.items + #S.out }
+    for _, list in ipairs({ S.items, S.out }) do
+        for _, stored in ipairs(list) do
+            for _, row in ipairs(slotRows) do
+                if row.invSlot ~= 0 and S:Fits(row.invSlot, stored.item) then
+                    counts[row.invSlot] = (counts[row.invSlot] or 0) + 1
+                end
             end
         end
     end
@@ -346,24 +525,43 @@ local function UpdateGrid()
     local pages = math.max(1, math.ceil(#gridList / perPage))
     gridPage = math.min(gridPage or 1, pages)
     for i, button in ipairs(gridButtons) do
-        local stored = gridList[(gridPage - 1) * perPage + i]
-        button.stored = stored
-        if stored then
-            local _, _, quality, texture = S:ItemInfo(stored.item)
+        local group = gridList[(gridPage - 1) * perPage + i]
+        button.group = group
+        if group then
+            local _, _, quality, texture = S:ItemInfo(group.item)
             button.icon:SetTexture(texture or QUESTION_MARK)
+            button.icon:SetVertexColor(1, 1, 1)
             SetQualityBorder(button, quality)
-            local uses = S.setsByGuid[stored.guid]
-            if uses then button.inSet:Show() else button.inSet:Hide() end
-            button.caption:SetText(uses and #uses > 1 and #uses or "")
+            -- The red X only when no copy is in the wardrobe.
+            SetUnavailable(button, group.available == 0)
+            if group.available > 0 and GroupWhyNot(group) then
+                SetUnusable(button)
+            end
+            local uses = GroupUses(group)
+            if #uses > 0 then button.inSet:Show() else button.inSet:Hide() end
+            button.caption:SetText(#uses > 1 and #uses or "")
+            button.count:SetText(#group.copies > 1 and #group.copies or "")
             button:Show()
         else
             button:Hide()
         end
     end
     pageText:SetText(string.format("Page %d / %d", gridPage, pages))
-    countText:SetText(string.format("%d / %d items stored", #S.items, S.maxItems))
+    if GearWardrobeDB.unusedOnly and S.viewing.samePool then
+        local copies = 0
+        for _, group in ipairs(gridList) do
+            copies = copies + #StoredCopies(group)
+        end
+        sellShownButton:SetText(string.format("Sell shown (%d)", copies))
+        sellShownButton:Show()
+        if copies > 0 then sellShownButton:Enable() else sellShownButton:Disable() end
+    else
+        sellShownButton:Hide()
+    end
+    countText:SetText(string.format("%d / %d items stored", #S.items, S.maxItems)
+        .. (#S.out > 0 and string.format("\n%d taken out by other characters", #S.out) or ""))
     gridTitle:SetText(string.format("%s  |cff888888(%d)|r", filterSlot == 0 and "All gear" or S.SLOTS[filterSlot].label,
-        #gridList))
+        gridCopies))
 end
 
 local function SetFilterSlot(invSlot)
@@ -376,24 +574,100 @@ local function GridReceiveDrag()
     local bag, slot = S:CursorPosition()
     if not bag then return end
     ClearCursor()
-    S:Deposit(bag, slot)
+    if S.viewing.samePool then
+        S:Deposit(bag, slot)
+    else
+        S:Print(S:ViewingName() .. " doesn't share your wardrobe; show yourself to store items.")
+    end
+end
+
+local function SellOne(copy)
+    local name = S:ItemInfo(copy.item) or "this item"
+    local text = string.format("Sell %s for %s?\nIt leaves the wardrobe for good.", name, Money(SellPrice(copy.item)))
+    local uses = S.usedBy[copy.guid]
+    if uses then
+        local names = {}
+        for _, use in ipairs(uses) do
+            table.insert(names, use.character .. ": " .. use.set)
+        end
+        text = text .. "\n\n|cffff8080Used by " .. table.concat(names, ", ") .. ".|r"
+    end
+    local dialog = StaticPopup_Show("GEARWARDROBE_SELL", text)
+    if dialog then dialog.data = { copy.guid } end
+end
+
+-- Right-click: take a copy out (to your bags) or sell it. Only for a wardrobe you share.
+local function GridItemMenu(group)
+    local name, _, quality = S:ItemInfo(group.item)
+    local color = ITEM_QUALITY_COLORS[quality] or ITEM_QUALITY_COLORS[1]
+    local entries = { { text = color.hex .. (name or "Item") .. "|r", isTitle = true, notCheckable = true } }
+    local take = CopyToTake(group)
+    if not S.viewing.samePool then
+        table.insert(entries, { text = S:ViewingName() .. " doesn't share your wardrobe", disabled = true,
+            notCheckable = true })
+    elseif not take then
+        table.insert(entries, { text = "No copy is in the wardrobe right now", disabled = true, notCheckable = true })
+    else
+        table.insert(entries, { text = "Take out (to your bags)", notCheckable = true,
+            func = function() S:Withdraw(take.guid) end })
+        local copy = StoredCopies(group)[1]
+        table.insert(entries, { text = "Sell" .. (#group.copies > 1 and " one" or "") .. " for "
+            .. Money(SellPrice(group.item)), notCheckable = true, func = function() SellOne(copy) end })
+    end
+    table.insert(entries, { text = CANCEL, notCheckable = true })
+    ShowMenu(entries)
+end
+
+local function SellShown()
+    local guids, total, unknown = {}, 0, false
+    for _, group in ipairs(gridList) do
+        for _, copy in ipairs(StoredCopies(group)) do
+            table.insert(guids, copy.guid)
+            local price = SellPrice(copy.item)
+            if price then total = total + price else unknown = true end
+        end
+    end
+    if #guids == 0 then return end
+    local dialog = StaticPopup_Show("GEARWARDROBE_SELL", string.format(
+        "Sell the %d items shown for %s%s?\nNo gear set uses them. They leave the wardrobe for good.",
+        #guids, unknown and "about " or "", GetCoinTextureString(total)))
+    if dialog then dialog.data = guids end
 end
 
 local function GridItemTooltip(button)
-    if not button.stored then return end
+    local group = button.group
+    if not group then return end
     GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
-    GameTooltip:SetHyperlink(button.stored.item)
+    GameTooltip:SetHyperlink(group.item)
     GameTooltip:AddLine(" ")
-    local uses = S.setsByGuid[button.stored.guid]
-    if uses then
+    if #group.copies > 1 then
+        GameTooltip:AddLine(string.format("%d copies, %d in the wardrobe", #group.copies, group.available), 1, 0.82, 0)
+    end
+    for _, copy in ipairs(group.copies) do
+        if copy.out then
+            GameTooltip:AddLine((#group.copies > 1 and "  One with " or "") .. copy.holder
+                .. (#group.copies > 1 and "" or " has this item"), 1, 0.2, 0.2)
+        end
+    end
+    if group.available == 0 then
+        GameTooltip:AddLine("Not available until it is back in the wardrobe.", 1, 1, 1, true)
+    end
+    local why = GroupWhyNot(group)
+    if why then
+        GameTooltip:AddLine(S:ViewingName() .. " can't wear this: " .. why, 1, 0.2, 0.2, true)
+    end
+    local uses = GroupUsedBy(group)
+    if #uses > 0 then
         GameTooltip:AddLine("Used by gear sets:", 1, 0.82, 0)
         for _, use in ipairs(uses) do
-            GameTooltip:AddLine("  " .. use.set.name .. " |cff888888(" .. S.SLOTS[use.invSlot].label .. ")|r", 1, 1, 1)
+            GameTooltip:AddLine("  " .. use.character .. ": " .. use.set .. " |cff888888(" .. S.SLOTS[use.invSlot].label
+                .. ")|r", 1, 1, 1)
         end
     else
         GameTooltip:AddLine("Not in any gear set", 0.6, 0.6, 0.6)
     end
-    GameTooltip:AddLine("Right-click to take it out. Shift-click to link.", 0.5, 0.5, 0.5, true)
+    GameTooltip:AddLine(group.available == 0 and "Shift-click to link."
+        or "Right-click to take it out or sell it. Shift-click to link.", 0.5, 0.5, 0.5, true)
     GameTooltip:Show()
 end
 
@@ -404,16 +678,16 @@ local barButtons = {}
 
 local function UpdateBar()
     if not bar then return end
-    if not GearWardrobeDB.showBar or #S.sets == 0 then
+    if not GearWardrobeDB.showBar or #S.mySets == 0 then
         bar:Hide()
         return
     end
-    for i, set in ipairs(S.sets) do
+    for i, set in ipairs(S.mySets) do
         local button = barButtons[i]
         if not button then
             button = CreateItemButton(bar, 30)
             button:SetPoint("LEFT", 8 + (i - 1) * 33, 0)
-            button:SetScript("OnClick", function(self) S:Equip(self.set.id) end)
+            button:SetScript("OnClick", function(self) S:EquipOwn(self.set.id) end)
             button:SetScript("OnEnter", function(self)
                 GameTooltip:SetOwner(self, "ANCHOR_TOP")
                 GameTooltip:AddLine(self.set.name)
@@ -427,10 +701,10 @@ local function UpdateBar()
         button.icon:SetTexture(S:SetIcon(set))
         button:Show()
     end
-    for i = #S.sets + 1, #barButtons do
+    for i = #S.mySets + 1, #barButtons do
         barButtons[i]:Hide()
     end
-    Size(bar, 16 + #S.sets * 33, 46)
+    Size(bar, 16 + #S.mySets * 33, 46)
     bar:Show()
 end
 
@@ -488,6 +762,13 @@ local function RefreshAll()
     if not selectedId and S.sets[1] then
         selectedId = S.sets[1].id
     end
+    if characterDrop then
+        local shown
+        for _, char in ipairs(S.chars) do
+            if (S.target == nil and char.self) or char.guid == S.target then shown = char end
+        end
+        UIDropDownMenu_SetText(characterDrop, shown and CharacterLabel(shown) or UnitName("player"))
+    end
     UpdateList()
     UpdateEditor()
     UpdateGrid()
@@ -539,7 +820,7 @@ local function CreateSetsPanel()
             UpdateEditor()
         end)
         row:SetScript("OnDoubleClick", function(self)
-            if self.set then S:Equip(self.set.id) end
+            if self.set and not S.viewing.offline then S:Equip(self.set.id) end
         end)
         listRows[i] = row
     end
@@ -639,10 +920,16 @@ local function CreateSetsPanel()
     saveButton:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:AddLine("Save worn gear")
-        GameTooltip:AddLine("Every slot the set doesn't ignore takes what you are wearing now.", 0.6, 0.6, 0.6, true)
+        GameTooltip:AddLine("Every slot the set doesn't ignore takes what " .. (S.viewing.self and "you are"
+            or S:ViewingName() .. " is") .. " wearing now.", 0.6, 0.6, 0.6, true)
         GameTooltip:Show()
     end)
     saveButton:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    offlineNote = setsPanel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    offlineNote:SetPoint("TOP", equipButton, "BOTTOM", 58, -6)
+    offlineNote:SetWidth(240)
+    offlineNote:Hide()
 end
 
 local function CreateWardrobePanel()
@@ -705,6 +992,39 @@ local function CreateWardrobePanel()
 
     countText = wardrobePanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     countText:SetPoint("TOPLEFT", slotBg, "BOTTOMLEFT", 6, -8)
+    countText:SetJustifyH("LEFT")
+
+    -- With Unused only on: sells every stored copy the grid shows (after a confirmation).
+    sellShownButton = CreateButton(wardrobePanel, "Sell shown", 150)
+    sellShownButton:SetPoint("TOPLEFT", slotBg, "BOTTOMLEFT", 2, -40)
+    sellShownButton:SetScript("OnClick", SellShown)
+    sellShownButton:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Sell shown")
+        GameTooltip:AddLine("Sells every stored item the grid shows for its vendor price; the gold goes to you. "
+            .. "Narrow it down with the slot list and the search box first.", 0.6, 0.6, 0.6, true)
+        GameTooltip:Show()
+    end)
+    sellShownButton:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    sellShownButton:Hide()
+
+    unusedCheck = CreateFrame("CheckButton", "GearWardrobeUnusedCheck", wardrobePanel, "UICheckButtonTemplate")
+    Size(unusedCheck, 24, 24)
+    unusedCheck:SetPoint("TOPLEFT", 360, -39)
+    _G["GearWardrobeUnusedCheckText"]:SetText("Unused only")
+    unusedCheck:SetScript("OnClick", function(self)
+        GearWardrobeDB.unusedOnly = self:GetChecked() and true or false
+        gridPage = 1
+        UpdateGrid()
+    end)
+    unusedCheck:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Unused only")
+        GameTooltip:AddLine("Only gear no gear set uses, of any character sharing the wardrobe (offline ones too).",
+            0.6, 0.6, 0.6, true)
+        GameTooltip:Show()
+    end)
+    unusedCheck:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     -- Right: the chosen slot's gear.
     local gridBg = CreateFrame("Button", nil, wardrobePanel)
@@ -743,19 +1063,22 @@ local function CreateWardrobePanel()
         button.inSet:SetPoint("TOPLEFT", -4, 4)
         button.inSet:SetTexture(SET_MARK)
         button.inSet:Hide()
+        -- How many copies the button stands for, when more than one.
+        button.count = button:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
+        button.count:SetPoint("TOPRIGHT", -2, -2)
         button:SetScript("OnEnter", GridItemTooltip)
         button:SetScript("OnLeave", function() GameTooltip:Hide() end)
         button:SetScript("OnReceiveDrag", GridReceiveDrag)
         button:SetScript("OnClick", function(self, mouse)
             if GetCursorInfo() then
                 GridReceiveDrag()
-            elseif not self.stored then
+            elseif not self.group then
                 return
             elseif IsShiftKeyDown() then
-                local _, link = S:ItemInfo(self.stored.item)
+                local _, link = S:ItemInfo(self.group.item)
                 if link then ChatEdit_InsertLink(link) end
             elseif mouse == "RightButton" then
-                S:Withdraw(self.stored.guid)
+                GridItemMenu(self.group)
             end
         end)
         gridButtons[i] = button
@@ -765,7 +1088,8 @@ local function CreateWardrobePanel()
     hint:SetPoint("TOPLEFT", gridBg, "BOTTOMLEFT", 6, -8)
     hint:SetWidth(230)
     hint:SetJustifyH("LEFT")
-    hint:SetText("Drag gear here to store it.\n|T" .. SET_MARK .. ":14|t marks items a gear set uses.")
+    hint:SetText("Drag gear here to store it.\n|T" .. SET_MARK .. ":14|t marks items a gear set uses.\n|T"
+        .. UNAVAILABLE_MARK .. ":14|t another character has it.")
 
     local prev = CreateButton(wardrobePanel, "<", 28)
     prev:SetPoint("TOPRIGHT", gridBg, "BOTTOMRIGHT", -110, -4)
@@ -785,7 +1109,7 @@ end
 
 local function CreateMainFrame()
     frame = CreateFrame("Frame", "GearWardrobeFrame", UIParent)
-    Size(frame, 620, 470)
+    Size(frame, 620, 492)
     frame:SetPoint("CENTER")
     frame:SetFrameStrata("DIALOG")
     frame:SetBackdrop({
@@ -814,6 +1138,54 @@ local function CreateMainFrame()
     local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", -6, -6)
 
+    -- Whose sets and wardrobe the window shows: you, or an online altbot you are master of.
+    characterDrop = CreateFrame("Frame", "GearWardrobeCharacterDrop", frame, "UIDropDownMenuTemplate")
+    characterDrop:SetPoint("TOPLEFT", 0, -10)
+    UIDropDownMenu_SetWidth(characterDrop, 170)
+    UIDropDownMenu_Initialize(characterDrop, function()
+        local heading = false
+        for _, char in ipairs(S.chars) do
+            if char.offline and not heading then
+                heading = true
+                local title = UIDropDownMenu_CreateInfo()
+                title.text = "Offline (edit sets only)"
+                title.isTitle = true
+                title.notCheckable = true
+                UIDropDownMenu_AddButton(title)
+            end
+            local info = UIDropDownMenu_CreateInfo()
+            info.text = CharacterLabel(char)
+            info.checked = (S.target == nil and char.self) or char.guid == S.target
+            info.func = function() S:SelectCharacter(char.guid) end
+            UIDropDownMenu_AddButton(info)
+        end
+        if #S.chars <= 1 then
+            local info = UIDropDownMenu_CreateInfo()
+            info.text = "|cff888888No other characters share your wardrobe|r"
+            info.notCheckable = true
+            info.disabled = true
+            UIDropDownMenu_AddButton(info)
+        end
+    end)
+
+    usableCheck = CreateFrame("CheckButton", "GearWardrobeUsableCheck", frame, "UICheckButtonTemplate")
+    Size(usableCheck, 24, 24)
+    usableCheck:SetPoint("TOPLEFT", 240, -39)
+    _G["GearWardrobeUsableCheckText"]:SetText("Usable only")
+    usableCheck:SetScript("OnClick", function(self)
+        GearWardrobeDB.usableOnly = self:GetChecked() and true or false
+        gridPage = 1
+        UpdateGrid()
+    end)
+    usableCheck:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Usable only")
+        GameTooltip:AddLine("Hide gear the shown character can't wear (class, armor type, level, an expansion not "
+            .. "reached yet). When off, that gear is greyed out.", 0.6, 0.6, 0.6, true)
+        GameTooltip:Show()
+    end)
+    usableCheck:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
     setsTab = CreateButton(frame, "Gear Sets", 100)
     setsTab:SetPoint("TOPLEFT", 20, -40)
     setsTab:SetScript("OnClick", function() ShowTab(false) end)
@@ -823,6 +1195,8 @@ local function CreateMainFrame()
 
     CreateSetsPanel()
     CreateWardrobePanel()
+    usableCheck:SetChecked(GearWardrobeDB.usableOnly)
+    unusedCheck:SetChecked(GearWardrobeDB.unusedOnly)
     ShowTab(false)
 end
 
@@ -866,7 +1240,7 @@ SlashCmdList["GEARWARDROBE"] = function(message)
     command = (command or ""):lower()
     if command == "equip" then
         local set = S:FindSet(rest)
-        if set then S:Equip(set.id) else S:Print("No gear set named '" .. rest .. "'.") end
+        if set then S:EquipOwn(set.id) else S:Print("No gear set named '" .. rest .. "'.") end
     elseif command == "bar" then
         GearWardrobeDB.showBar = not GearWardrobeDB.showBar
         UpdateBar()

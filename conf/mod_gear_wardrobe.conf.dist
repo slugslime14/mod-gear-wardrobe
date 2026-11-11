@@ -26,8 +26,32 @@ GearWardrobe.MaxSets = 50
 
 #
 #    GearWardrobe.MaxItems
-#        Description: Maximum number of items a character can keep in the wardrobe.
+#        Description: Maximum number of items a character can keep in the wardrobe. With
+#                     GearWardrobe.SharedPool = 1 the limit is for the whole shared wardrobe.
 #        Default:     500
 #
 
 GearWardrobe.MaxItems = 500
+
+#
+#    GearWardrobe.SharedPool
+#        Description: Let the characters of an account share one wardrobe. Each character keeps
+#                     its own gear sets, and the sets can use any stored item; an item taken out
+#                     becomes the taker's (soulbound items included). Turning it off again is
+#                     safe: each character then sees only the items it stored itself.
+#        Default:     0 (Disabled)
+#                     1 (Enabled)
+#
+
+GearWardrobe.SharedPool = 0
+
+#
+#    GearWardrobe.SharedPool.LinkedAccounts
+#        Description: With GearWardrobe.SharedPool = 1, also share with accounts linked through
+#                     mod-playerbots (.playerbots account link). Links are re-read whenever a
+#                     character logs in. Has no effect without mod-playerbots.
+#        Default:     1 (Enabled)
+#                     0 (Disabled)
+#
+
+GearWardrobe.SharedPool.LinkedAccounts = 1

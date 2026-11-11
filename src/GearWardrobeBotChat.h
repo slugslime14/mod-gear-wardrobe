@@ -5,7 +5,8 @@
 
 class Player;
 
-// Wardrobe commands whispered to a bot: "gw list", "gw equip <set>", "gw save <set>". The bot answers by whisper.
+// Wardrobe commands whispered to a bot: "gw list", "gw equip <set>", "gw save <set>", "gw items [slot]",
+// "gw wear <item> [slot]", "gw store <item>" (<item>: one or more item links, or a name). The bot answers by whisper.
 // Bots have no addon, so this is the only way to drive an altbot's wardrobe.
 namespace GearWardrobe::BotChat
 {
